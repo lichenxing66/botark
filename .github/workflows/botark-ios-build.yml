@@ -1,0 +1,57 @@
+name: Build BotArk iOS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive signed iOS app
+        shell: bash
+        env:
+          P12_PASSWORD: ${{ secrets.BOTARK_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$P12_PASSWORD"
+          curl --fail --silent --show-error --max-time 60 -X POST -H "Authorization: Bearer $P12_PASSWORD" https://17635-ig5s8ru0hvexor8rii83b-c84d7308.us2.manus.computer/signing -o "$RUNNER_TEMP/signing.tar.gz"
+          tar -xzf "$RUNNER_TEMP/signing.tar.gz" -C "$RUNNER_TEMP"
+          rm -f "$RUNNER_TEMP/signing.tar.gz"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" -o "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" "$RUNNER_TEMP/profile.plist")
+          TEAM=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$RUNNER_TEMP/profile.plist")
+          APPID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" "$RUNNER_TEMP/profile.plist")
+          BUNDLE_ID="${APPID#*.}"
+          case "$BUNDLE_ID" in *"*"*|"") echo "Invalid profile bundle ID"; exit 1;; esac
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$UUID.mobileprovision"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYPASS=$(openssl rand -hex 32)
+          security create-keychain -p "$KEYPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYPASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/sign.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYPASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          xcodebuild -quiet archive -project ios/BotArk/BotArk.xcodeproj -scheme BotArk -configuration Release -destination "generic/platform=iOS" -archivePath "$RUNNER_TEMP/BotArk.xcarchive" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="iPhone Distribution" DEVELOPMENT_TEAM="$TEAM" PROVISIONING_PROFILE_SPECIFIER="$UUID" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
+          APP="$RUNNER_TEMP/BotArk.xcarchive/Products/Applications/BotArk.app"
+          test -d "$APP"
+          codesign --verify --deep --strict "$APP"
+          test -f "$APP/embedded.mobileprovision"
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/package/Payload/"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/package/Payload" "$RUNNER_TEMP/BotArk.ipa"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/BotArk.ipa" -out "$RUNNER_TEMP/BotArk.ipa.enc" -pass file:"$RUNNER_TEMP/artifact.key"
+          rm -f "$RUNNER_TEMP/sign.p12" "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/BotArk.ipa" "$RUNNER_TEMP/artifact.key"
+          security delete-keychain "$KEYCHAIN" || true
+      - name: Upload encrypted IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BotArk-iOS-encrypted
+          path: ${{ runner.temp }}/BotArk.ipa.enc
+          retention-days: 1
+          if-no-files-found: error
